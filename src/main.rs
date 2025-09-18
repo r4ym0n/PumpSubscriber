@@ -1,6 +1,8 @@
 use chrono::Local;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::http::Request;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use url::Url;
 use serde_json::{json, Map, Value};
 use std::{env, time::Duration};
 use tokio::time::sleep;
@@ -15,6 +17,57 @@ fn now_ts_ms() -> String {
         now.format("%Y-%m-%d %H:%M:%S"),
         now.timestamp_subsec_millis()
     )
+}
+
+fn print_parsed_line(subject: &str, payload: &str) {
+    let ts = now_ts_ms();
+    // Try to unwrap quoted JSON string if needed
+    let mut text = payload.to_string();
+    if text.starts_with('"') && text.ends_with('"') {
+        if let Ok(unwrapped) = serde_json::from_str::<String>(&text) {
+            text = unwrapped;
+        }
+    }
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(obj)) => {
+            let mint = obj.get("mint").cloned().unwrap_or(Value::Null);
+            let image = obj.get("image").cloned().unwrap_or(Value::Null);
+            println!(
+                "{}",
+                json!({
+                    "ts": ts,
+                    "subject": subject,
+                    "mint": mint,
+                    "image": image
+                })
+                .to_string()
+            );
+        }
+        Ok(_) => {
+            println!(
+                "{}",
+                json!({
+                    "ts": ts,
+                    "subject": subject,
+                    "non_object": true
+                })
+                .to_string()
+            );
+        }
+        Err(err) => {
+            let preview: String = text.chars().take(200).collect();
+            println!(
+                "{}",
+                json!({
+                    "ts": ts,
+                    "subject": subject,
+                    "error": err.to_string(),
+                    "payload_preview": preview
+                })
+                .to_string()
+            );
+        }
+    }
 }
 
 fn build_connect_options() -> Value {
@@ -53,28 +106,23 @@ fn build_connect_options() -> Value {
 }
 
 async fn run_once(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut req = Request::builder().method("GET").uri(url);
-    let headers = req.headers_mut().unwrap();
-    headers.insert("Sec-WebSocket-Protocol", "nats".parse()?);
-    headers.insert("Origin", "https://pump.fun".parse()?);
-    headers.insert("Pragma", "no-cache".parse()?);
-    headers.insert("Cache-Control", "no-cache".parse()?);
-    headers.insert("Accept-Encoding", "gzip, deflate, br, zstd".parse()?);
-    headers.insert("Accept-Language", "zh-CN,zh;q=0.9".parse()?);
-    headers.insert(
+    let url_parsed = Url::parse(url)?;
+    let mut req: Request<()> = url_parsed.as_str().into_client_request()?;
+    let headers = req.headers_mut();
+    headers.append("Sec-WebSocket-Protocol", "nats".parse()?);
+    headers.append("Origin", "https://pump.fun".parse()?);
+    headers.append("Pragma", "no-cache".parse()?);
+    headers.append("Cache-Control", "no-cache".parse()?);
+    headers.append("Accept-Encoding", "gzip, deflate, br, zstd".parse()?);
+    headers.append("Accept-Language", "zh-CN,zh;q=0.9".parse()?);
+    headers.append(
         "User-Agent",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
             .parse()?,
     );
-    if let Ok(swk) = env::var("PUMP_WS_KEY") {
-        headers.insert("Sec-WebSocket-Key", swk.parse()?);
-    } else {
-        headers.insert("Sec-WebSocket-Key", "IgTbIuAbBcB0BmbCyLtDKA==".parse()?);
-    }
     if let Ok(bearer) = env::var("PUMP_WS_BEARER") {
-        headers.insert("Authorization", format!("Bearer {}", bearer).parse()?);
+        headers.append("Authorization", format!("Bearer {}", bearer).parse()?);
     }
-    let req = req.body(())?;
 
     let (mut ws, _resp) = connect_async(req).await?;
 
@@ -139,9 +187,11 @@ async fn run_once(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
 
             if let Some(hlen) = expected_header_len.take() {
                 let body = &payload_block[hlen..];
-                println!("{}", body);
+                let subject = current_subject.as_deref().unwrap_or("");
+                print_parsed_line(subject, body);
             } else {
-                println!("{}", payload_block);
+                let subject = current_subject.as_deref().unwrap_or("");
+                print_parsed_line(subject, &payload_block);
             }
 
             expected_payload = None;
@@ -171,7 +221,7 @@ async fn run_once(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
             // Send CONNECT and SUB after INFO
             if !connected {
                 if let Ok(info_obj) = serde_json::from_str::<Value>(&line[5..]) {
-                    eprintln!(
+                    println!(
                         "{}",
                         json!({
                             "ts": now_ts_ms(),
@@ -229,7 +279,7 @@ async fn main() {
                 backoff = 1; // normal end, but typically we shouldn't exit; reconnect anyway
             }
             Err(e) => {
-                eprintln!(
+                println!(
                     "{}",
                     json!({
                         "ts": now_ts_ms(),

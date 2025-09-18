@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.80 as builder
+FROM rust:1.89 as builder
 WORKDIR /app
 COPY Cargo.toml ./
 COPY src ./src
