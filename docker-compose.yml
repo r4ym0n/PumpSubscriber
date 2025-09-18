@@ -1,18 +1,30 @@
 version: "3.8"
 services:
-  subscriber:
+  subscriber-ipfs-io:
     build:
       context: ./rs_subscriber
-    environment:
-      - NATS_WS_URL=${NATS_WS_URL:-wss://prod-advanced.nats.realtime.pump.fun/}
-      - PUMP_NATS_USER=${PUMP_NATS_USER:-subscriber}
-      - PUMP_NATS_PASS=${PUMP_NATS_PASS:-OktDhmZ2D3CtYUiM}
-      - PUMP_NATS_PASSWORD=${PUMP_NATS_PASSWORD}
-      - PUMP_NATS_TOKEN=${PUMP_NATS_TOKEN}
-      - PUMP_NATS_JWT=${PUMP_NATS_JWT}
-      - PUMP_NATS_SIG=${PUMP_NATS_SIG}
-      - PUMP_WS_KEY=${PUMP_WS_KEY:-IgTbIuAbBcB0BmbCyLtDKA==}
-      - PUMP_WS_BEARER=${PUMP_WS_BEARER}
+    env_file:
+      - env/env.common
+      - env/ipfs-io.env
+    container_name: rs-subscriber-ipfs-io
+    restart: unless-stopped
+
+  subscriber-cloudflare:
+    build:
+      context: ./rs_subscriber
+    env_file:
+      - env/env.common
+      - env/cloudflare.env
+    container_name: rs-subscriber-cloudflare
+    restart: unless-stopped
+
+  subscriber-dweb:
+    build:
+      context: ./rs_subscriber
+    env_file:
+      - env/env.common
+      - env/dweb.env
+    container_name: rs-subscriber-dweb
     restart: unless-stopped
 
 
