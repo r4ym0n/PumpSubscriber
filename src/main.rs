@@ -206,6 +206,7 @@ fn build_connect_options() -> Value {
 struct IpfsConfig {
     enabled: bool,
     gateway: String,
+    gateways: Vec<String>,
     timeout_ms: u64,
     max_bytes: u64,
 }
@@ -213,10 +214,27 @@ struct IpfsConfig {
 impl IpfsConfig {
     fn from_env() -> Self {
         let enabled = env_bool("IPFS_PULL_ENABLED", false);
-        let gateway = env::var("IPFS_GATEWAY").unwrap_or_else(|_| "https://ipfs.io/ipfs".to_string());
+        // Prefer multiple gateways if provided, fallback to single gateway var, then default
+        let gateways: Vec<String> = match env::var("IPFS_GATEWAYS") {
+            Ok(v) => v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let gateway_single = env::var("IPFS_GATEWAY").ok();
+        let gateways = if !gateways.is_empty() {
+            gateways
+        } else if let Some(g) = gateway_single.clone() {
+            vec![g]
+        } else {
+            vec!["https://ipfs.io/ipfs".to_string()]
+        };
+        let gateway = gateways.first().cloned().unwrap_or_else(|| "https://ipfs.io/ipfs".to_string());
         let timeout_ms = env::var("IPFS_TIMEOUT_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20000);
         let max_bytes = env::var("IPFS_MAX_BYTES").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20 * 1024 * 1024);
-        Self { enabled, gateway, timeout_ms, max_bytes }
+        Self { enabled, gateway, gateways, timeout_ms, max_bytes }
     }
 }
 
@@ -268,7 +286,7 @@ fn build_gateway_url(gateway: &str, cid: &str) -> String {
     format!("{}/{}", g, cid)
 }
 
-async fn ipfs_fetch_and_log(subject: String, mint: String, cid: String, url: String, ipfs: IpfsConfig) {
+async fn ipfs_fetch_and_log(subject: String, mint: String, cid: String, gateway: String, ipfs: IpfsConfig) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(ipfs.timeout_ms))
         .build()
@@ -280,19 +298,21 @@ async fn ipfs_fetch_and_log(subject: String, mint: String, cid: String, url: Str
                 ("subject", Value::from(subject)),
                 ("mint", Value::from(mint)),
                 ("cid", Value::from(cid)),
+                ("gateway", Value::from(gateway)),
                 ("error", Value::from(format!("client_build: {}", e))),
             ]);
             return;
         }
     };
 
-    let final_url = build_gateway_url(&ipfs.gateway, &cid);
+    let final_url = build_gateway_url(&gateway, &cid);
 
     print_line(vec![
         ("event", Value::from("ipfs_pull_start")),
         ("subject", Value::from(subject.clone())),
         ("mint", Value::from(mint.clone())),
         ("cid", Value::from(cid.clone())),
+        ("gateway", Value::from(gateway.clone())),
         ("url", Value::from(final_url.clone())),
     ]);
 
@@ -306,6 +326,7 @@ async fn ipfs_fetch_and_log(subject: String, mint: String, cid: String, url: Str
                     ("subject", Value::from(subject)),
                     ("mint", Value::from(mint)),
                     ("cid", Value::from(cid)),
+                    ("gateway", Value::from(gateway)),
                     ("url", Value::from(final_url)),
                     ("status", Value::from(resp.status().as_u16() as i64)),
                 ]);
@@ -325,6 +346,7 @@ async fn ipfs_fetch_and_log(subject: String, mint: String, cid: String, url: Str
                             ("event", Value::from("ipfs_pull_error")),
                             ("error", Value::from(e.to_string())),
                             ("bytes", Value::from(bytes as i64)),
+                            ("gateway", Value::from(gateway.clone())),
                         ]);
                         return;
                     }
@@ -337,12 +359,14 @@ async fn ipfs_fetch_and_log(subject: String, mint: String, cid: String, url: Str
                 ("bytes", Value::from(bytes as i64)),
                 ("elapsed_ms", Value::from(elapsed_ms as i64)),
                 ("speed_kbps", Value::from(kbps as i64)),
+                ("gateway", Value::from(gateway)),
             ]);
         }
         Err(e) => {
             print_line(vec![
                 ("event", Value::from("ipfs_pull_error")),
                 ("error", Value::from(e.to_string())),
+                ("gateway", Value::from(gateway)),
             ]);
         }
     }
@@ -374,9 +398,16 @@ fn try_spawn_ipfs_fetch(subject: &str, body: &str, ipfs: &IpfsConfig) {
             if let Some(cid) = extract_cid_from_url(&image_s) {
                 let subject_s = subject.to_string();
                 let ipfs_cfg = ipfs.clone();
-                tokio::spawn(async move {
-                    ipfs_fetch_and_log(subject_s, mint, cid, image_s, ipfs_cfg).await;
-                });
+                let gateways = ipfs_cfg.gateways.clone();
+                for gw in gateways {
+                    let subject_s2 = subject_s.clone();
+                    let mint2 = mint.clone();
+                    let cid2 = cid.clone();
+                    let ipfs_cfg2 = ipfs_cfg.clone();
+                    tokio::spawn(async move {
+                        ipfs_fetch_and_log(subject_s2, mint2, cid2, gw, ipfs_cfg2).await;
+                    });
+                }
             } else {
                 let preview: String = image_s.chars().take(200).collect();
                 print_line(vec![
@@ -604,6 +635,7 @@ async fn main() {
         ("VALIDATE_INFO_KEYS", Value::from(Value::Array(vcfg.require_info_keys.iter().map(|s| Value::from(s.clone())).collect()))),
         ("IPFS_PULL_ENABLED", Value::from(ipfs_preview.enabled)),
         ("IPFS_GATEWAY", Value::from(ipfs_preview.gateway.clone())),
+        ("IPFS_GATEWAYS", Value::from(Value::Array(ipfs_preview.gateways.iter().map(|s| Value::from(s.clone())).collect()))),
         ("IPFS_TIMEOUT_MS", Value::from(ipfs_preview.timeout_ms as i64)),
         ("IPFS_MAX_BYTES", Value::from(ipfs_preview.max_bytes as i64)),
     ]);
