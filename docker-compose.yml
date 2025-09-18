@@ -1,0 +1,18 @@
+version: "3.8"
+services:
+  subscriber:
+    build:
+      context: ./rs_subscriber
+    environment:
+      - NATS_WS_URL=${NATS_WS_URL:-wss://prod-advanced.nats.realtime.pump.fun/}
+      - PUMP_NATS_USER=${PUMP_NATS_USER:-subscriber}
+      - PUMP_NATS_PASS=${PUMP_NATS_PASS:-OktDhmZ2D3CtYUiM}
+      - PUMP_NATS_PASSWORD=${PUMP_NATS_PASSWORD}
+      - PUMP_NATS_TOKEN=${PUMP_NATS_TOKEN}
+      - PUMP_NATS_JWT=${PUMP_NATS_JWT}
+      - PUMP_NATS_SIG=${PUMP_NATS_SIG}
+      - PUMP_WS_KEY=${PUMP_WS_KEY:-IgTbIuAbBcB0BmbCyLtDKA==}
+      - PUMP_WS_BEARER=${PUMP_WS_BEARER}
+    restart: unless-stopped
+
+
