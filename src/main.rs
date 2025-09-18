@@ -19,7 +19,48 @@ fn now_ts_ms() -> String {
     )
 }
 
-fn print_parsed_line(subject: &str, payload: &str) {
+fn env_bool(name: &str, default_val: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => default_val,
+    }
+}
+
+fn env_csv(name: &str) -> Vec<String> {
+    match std::env::var(name) {
+        Ok(v) => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+struct ValidateConfig {
+    enabled: bool,
+    allowed_subject_prefixes: Vec<String>,
+    require_mint: bool,
+    require_image: bool,
+    require_info_keys: Vec<String>,
+}
+
+impl ValidateConfig {
+    fn from_env() -> Self {
+        Self {
+            enabled: env_bool("VALIDATE_ENABLED", false),
+            allowed_subject_prefixes: env_csv("VALIDATE_ALLOWED_SUBJECTS"),
+            require_mint: env_bool("VALIDATE_REQUIRE_MINT", false),
+            require_image: env_bool("VALIDATE_REQUIRE_IMAGE", false),
+            require_info_keys: env_csv("VALIDATE_INFO_KEYS"),
+        }
+    }
+}
+
+fn print_parsed_line(subject: &str, payload: &str, vcfg: &ValidateConfig) {
     let ts = now_ts_ms();
     // Try to unwrap quoted JSON string if needed
     let mut text = payload.to_string();
@@ -42,6 +83,66 @@ fn print_parsed_line(subject: &str, payload: &str) {
                 })
                 .to_string()
             );
+
+            if vcfg.enabled {
+                if !vcfg.allowed_subject_prefixes.is_empty()
+                    && !vcfg
+                        .allowed_subject_prefixes
+                        .iter()
+                        .any(|p| subject.starts_with(p))
+                {
+                    println!(
+                        "{}",
+                        json!({
+                            "ts": now_ts_ms(),
+                            "event": "validation_error",
+                            "reason": "subject_disallowed",
+                            "subject": subject
+                        })
+                        .to_string()
+                    );
+                }
+
+                if vcfg.require_mint {
+                    let missing = match obj.get("mint") {
+                        Some(Value::String(s)) => s.is_empty(),
+                        Some(Value::Null) | None => true,
+                        _ => false,
+                    };
+                    if missing {
+                        println!(
+                            "{}",
+                            json!({
+                                "ts": now_ts_ms(),
+                                "event": "validation_error",
+                                "reason": "missing_mint",
+                                "subject": subject
+                            })
+                            .to_string()
+                        );
+                    }
+                }
+
+                if vcfg.require_image {
+                    let missing = match obj.get("image") {
+                        Some(Value::String(s)) => s.is_empty(),
+                        Some(Value::Null) | None => true,
+                        _ => false,
+                    };
+                    if missing {
+                        println!(
+                            "{}",
+                            json!({
+                                "ts": now_ts_ms(),
+                                "event": "validation_error",
+                                "reason": "missing_image",
+                                "subject": subject
+                            })
+                            .to_string()
+                        );
+                    }
+                }
+            }
         }
         Ok(_) => {
             println!(
@@ -188,10 +289,12 @@ async fn run_once(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
             if let Some(hlen) = expected_header_len.take() {
                 let body = &payload_block[hlen..];
                 let subject = current_subject.as_deref().unwrap_or("");
-                print_parsed_line(subject, body);
+                let vcfg = ValidateConfig::from_env();
+                print_parsed_line(subject, body, &vcfg);
             } else {
                 let subject = current_subject.as_deref().unwrap_or("");
-                print_parsed_line(subject, &payload_block);
+                let vcfg = ValidateConfig::from_env();
+                print_parsed_line(subject, &payload_block, &vcfg);
             }
 
             expected_payload = None;
@@ -221,19 +324,40 @@ async fn run_once(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
             // Send CONNECT and SUB after INFO
             if !connected {
                 if let Ok(info_obj) = serde_json::from_str::<Value>(&line[5..]) {
+                    let keys_value = info_obj.as_object().map(|o| {
+                        let mut keys: Vec<_> = o.keys().cloned().collect();
+                        keys.sort();
+                        Value::from(keys)
+                    }).unwrap_or_else(|| Value::from(Vec::<String>::new()));
                     println!(
                         "{}",
                         json!({
                             "ts": now_ts_ms(),
                             "event": "server_info",
-                            "info_keys": info_obj.as_object().map(|o| {
-                                let mut keys: Vec<_> = o.keys().cloned().collect();
-                                keys.sort();
-                                Value::from(keys)
-                            }).unwrap_or_else(|| Value::from(Vec::<String>::new()))
+                            "info_keys": keys_value
                         })
                         .to_string()
                     );
+
+                    let vcfg = ValidateConfig::from_env();
+                    if vcfg.enabled {
+                        if let (Some(map), req_keys) = (info_obj.as_object(), &vcfg.require_info_keys) {
+                            for k in req_keys {
+                                if !map.contains_key(k) {
+                                    println!(
+                                        "{}",
+                                        json!({
+                                            "ts": now_ts_ms(),
+                                            "event": "validation_error",
+                                            "reason": "info_key_missing",
+                                            "key": k
+                                        })
+                                        .to_string()
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 let connect_opts = build_connect_options();
                 let connect_line = format!("CONNECT {}\r\n", connect_opts.to_string());
