@@ -37,7 +37,7 @@ def analyze_performance(log_file):
     gateway_stats = defaultdict(list)
     
     # 按小时统计
-    hourly_stats = defaultdict(lambda: {'success': 0, 'failed': 0, 'total_time': 0})
+    hourly_stats = defaultdict(lambda: {'success': 0, 'failed': 0, 'total_time': 0, 'times': []})
     
     print("📊 正在分析日志文件...")
     
@@ -64,8 +64,10 @@ def analyze_performance(log_file):
                 try:
                     ts = data.get('ts', '')
                     hour = ts.split(' ')[1].split(':')[0] if ' ' in ts else '00'
+                    elapsed_ms = data.get('total_elapsed_ms', 0)
                     hourly_stats[hour]['success'] += 1
-                    hourly_stats[hour]['total_time'] += data.get('total_elapsed_ms', 0)
+                    hourly_stats[hour]['total_time'] += elapsed_ms
+                    hourly_stats[hour]['times'].append(elapsed_ms)
                 except:
                     pass
             
@@ -110,6 +112,24 @@ def calculate_percentiles(data, percentiles=[50, 75, 90, 95, 99]):
             idx = len(sorted_data) - 1
         result[p] = sorted_data[idx]
     return result
+
+def calculate_p95_average(data):
+    """计算P95平均耗时（去除极大值后的平均）"""
+    if not data:
+        return 0
+    
+    if len(data) == 1:
+        return data[0]
+    
+    # 计算P95分位数作为截断点
+    sorted_data = sorted(data)
+    p95_idx = int(len(sorted_data) * 95 / 100)
+    if p95_idx >= len(sorted_data):
+        p95_idx = len(sorted_data) - 1
+    
+    # 取P95以下的数据计算平均值
+    p95_data = sorted_data[:p95_idx + 1]
+    return statistics.mean(p95_data) if p95_data else 0
 
 def format_time(ms):
     """格式化时间显示"""
@@ -204,11 +224,11 @@ def print_report(stats):
     all_times = [event.get('total_elapsed_ms', 0) for event in success_events]
     avg_time = statistics.mean(all_times)
     percentiles = calculate_percentiles(all_times)
-    p95_time = percentiles[95]
+    p95_avg_time = calculate_p95_average(all_times)
     
     print(f"样本数量: {len(all_times):,}")
     print(f"平均耗时: {format_time(avg_time)}")
-    print(f"P95耗时: {format_time(p95_time)}")
+    print(f"P95平均耗时: {format_time(p95_avg_time)}")
     print(f"最短耗时: {format_time(min(all_times))}")
     print(f"最长耗时: {format_time(max(all_times))}")
     print(f"标准差: {format_time(statistics.stdev(all_times) if len(all_times) > 1 else 0)}")
@@ -243,23 +263,23 @@ def print_report(stats):
         for gateway, times in gateway_stats.items():
             if times:
                 avg_time = statistics.mean(times)
-                p95_time = calculate_percentiles(times, [95])[95]
-                gateway_performance.append((gateway, avg_time, p95_time, len(times)))
+                p95_avg_time = calculate_p95_average(times)
+                gateway_performance.append((gateway, avg_time, p95_avg_time, len(times)))
         
         # 按平均时间排序
         gateway_performance.sort(key=lambda x: x[1])
         
-        print(f"{'网关':<35} {'平均耗时':<10} {'P95耗时':<10} {'次数':<6} {'性能'}")
+        print(f"{'网关':<35} {'平均耗时':<10} {'P95平均':<10} {'次数':<6} {'性能'}")
         print("-" * 80)
         
-        for gateway, avg_time, p95_time, count in gateway_performance:
+        for gateway, avg_time, p95_avg_time, count in gateway_performance:
             # 简化网关名称显示
             gateway_name = gateway.replace('https://', '').replace('/ipfs', '')
             if len(gateway_name) > 32:
                 gateway_name = gateway_name[:29] + "..."
             
             performance_bar = "★" * min(5, max(1, int(6 - avg_time/1000)))  # 性能星级
-            print(f"{gateway_name:<35} {format_time(avg_time):<10} {format_time(p95_time):<10} {count:<6} {performance_bar}")
+            print(f"{gateway_name:<35} {format_time(avg_time):<10} {format_time(p95_avg_time):<10} {count:<6} {performance_bar}")
     
     # 5. 文件大小和速度分析
     print(f"\n📦 文件大小和下载速度分析")
@@ -287,8 +307,8 @@ def print_report(stats):
         print(f"\n🕐 按小时活动统计")
         print("-" * 40)
         
-        print(f"{'小时':<6} {'成功':<6} {'失败':<6} {'成功率':<8} {'平均耗时'}")
-        print("-" * 45)
+        print(f"{'小时':<6} {'成功':<6} {'失败':<6} {'成功率':<8} {'平均耗时':<10} {'P95平均'}")
+        print("-" * 60)
         
         for hour in sorted(hourly_stats.keys()):
             stats_hour = hourly_stats[hour]
@@ -299,7 +319,8 @@ def print_report(stats):
             if total > 0:
                 success_rate_hour = success / total * 100
                 avg_time_hour = stats_hour['total_time'] / success if success > 0 else 0
-                print(f"{hour}:00  {success:<6} {failed:<6} {success_rate_hour:6.1f}%  {format_time(avg_time_hour)}")
+                p95_avg_hour = calculate_p95_average(stats_hour['times']) if stats_hour['times'] else 0
+                print(f"{hour}:00  {success:<6} {failed:<6} {success_rate_hour:6.1f}%  {format_time(avg_time_hour):<10} {format_time(p95_avg_hour)}")
     
     # 7. 数据故事总结
     print(f"\n📖 数据故事总结")
@@ -317,11 +338,11 @@ def print_report(stats):
     if slow_requests > 0:
         print(f"  • {slow_requests:,} 次拉取超过2秒({slow_requests/len(success_events)*100:.1f}%)，需要关注慢请求优化")
     
-    print(f"  • 平均拉取时间为 {format_time(avg_time)}，P95拉取时间为 {format_time(percentiles[95])}，整体性能{'良好' if avg_time < 1000 else '一般' if avg_time < 2000 else '需要优化'}")
+    print(f"  • 平均拉取时间为 {format_time(avg_time)}，P95平均拉取时间为 {format_time(p95_avg_time)}，整体性能{'良好' if avg_time < 1000 else '一般' if avg_time < 2000 else '需要优化'}")
     
     if gateway_performance:
         best_gateway = gateway_performance[0][0].replace('https://', '').replace('/ipfs', '')
-        print(f"  • 最快的公共网关是 {best_gateway}，平均响应时间 {format_time(gateway_performance[0][1])}，P95响应时间 {format_time(gateway_performance[0][2])}")
+        print(f"  • 最快的公共网关是 {best_gateway}，平均响应时间 {format_time(gateway_performance[0][1])}，P95平均响应时间 {format_time(gateway_performance[0][2])}")
     
     print(f"\n💡 优化建议:")
     if local_count / len(success_events) < 0.5:
@@ -346,7 +367,7 @@ def main():
         if args.json:
             # 输出JSON格式的统计数据
             all_times = [event.get('total_elapsed_ms', 0) for event in stats['success_events']]
-            overall_p95 = calculate_percentiles(all_times, [95])[95] if all_times else 0
+            overall_p95_avg = calculate_p95_average(all_times) if all_times else 0
             overall_avg = statistics.mean(all_times) if all_times else 0
             
             json_stats = {
@@ -355,11 +376,11 @@ def main():
                 'local_success_count': len(stats['local_success']),
                 'fallback_success_count': len(stats['fallback_success']),
                 'overall_avg_time': overall_avg,
-                'overall_p95_time': overall_p95,
+                'overall_p95_avg_time': overall_p95_avg,
                 'gateway_stats': {k: {
                     'count': len(v), 
                     'avg_time': statistics.mean(v) if v else 0,
-                    'p95_time': calculate_percentiles(v, [95])[95] if v else 0
+                    'p95_avg_time': calculate_p95_average(v) if v else 0
                 } for k, v in stats['gateway_stats'].items()}
             }
             print(json.dumps(json_stats, indent=2, ensure_ascii=False))
