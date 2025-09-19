@@ -209,6 +209,7 @@ struct IpfsConfig {
     gateways: Vec<String>,
     timeout_ms: u64,
     max_bytes: u64,
+    delay_ms: u64,
 }
 
 impl IpfsConfig {
@@ -234,7 +235,8 @@ impl IpfsConfig {
         let gateway = gateways.first().cloned().unwrap_or_else(|| "https://ipfs.io/ipfs".to_string());
         let timeout_ms = env::var("IPFS_TIMEOUT_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20000);
         let max_bytes = env::var("IPFS_MAX_BYTES").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20 * 1024 * 1024);
-        Self { enabled, gateway, gateways, timeout_ms, max_bytes }
+        let delay_ms = env::var("IPFS_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(50);
+        Self { enabled, gateway, gateways, timeout_ms, max_bytes, delay_ms }
     }
 }
 
@@ -287,6 +289,11 @@ fn build_gateway_url(gateway: &str, cid: &str) -> String {
 }
 
 async fn ipfs_fetch_and_log(subject: String, mint: String, cid: String, gateway: String, ipfs: IpfsConfig) {
+    // Add configurable delay before IPFS fetch to avoid triggering search instead of cache
+    if ipfs.delay_ms > 0 {
+        sleep(Duration::from_millis(ipfs.delay_ms)).await;
+    }
+
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(ipfs.timeout_ms))
         .build()
@@ -314,6 +321,7 @@ async fn ipfs_fetch_and_log(subject: String, mint: String, cid: String, gateway:
         ("cid", Value::from(cid.clone())),
         ("gateway", Value::from(gateway.clone())),
         ("url", Value::from(final_url.clone())),
+        ("delay_ms", Value::from(ipfs.delay_ms as i64)),
     ]);
 
     let started = Instant::now();
@@ -641,6 +649,7 @@ async fn main() {
         ("IPFS_GATEWAYS", Value::from(Value::Array(ipfs_preview.gateways.iter().map(|s| Value::from(s.clone())).collect()))),
         ("IPFS_TIMEOUT_MS", Value::from(ipfs_preview.timeout_ms as i64)),
         ("IPFS_MAX_BYTES", Value::from(ipfs_preview.max_bytes as i64)),
+        ("IPFS_DELAY_MS", Value::from(ipfs_preview.delay_ms as i64)),
     ]);
     loop {
         let ipfs = IpfsConfig::from_env();

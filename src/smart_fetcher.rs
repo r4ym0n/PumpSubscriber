@@ -6,7 +6,7 @@ use url::Url;
 use serde_json::{json, Map, Value};
 use std::{env, time::Duration};
 use std::time::Instant;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use dotenvy::dotenv;
 
@@ -379,56 +379,70 @@ async fn smart_ipfs_fetch_and_log(
         ("fallback_threshold_ms", Value::from(config.fallback_threshold_ms as i64)),
     ]);
 
-    // Phase 1: Try local gateway with timeout
-    let local_start = Instant::now();
-    let local_result = timeout(
-        Duration::from_millis(config.fallback_threshold_ms),
-        fetch_from_gateway(
-            &config.local_gateway,
-            &cid,
-            config.local_timeout_ms,
-            config.max_bytes,
-        ),
-    )
-    .await;
+    // Phase 1: Start local gateway request (no timeout, let it compete)
+    let local_gateway_clone = config.local_gateway.clone();
+    let local_cid_clone = cid.clone();
+    let local_config_clone = config.clone();
+    
+    let mut local_task = tokio::spawn(async move {
+        let result = fetch_from_gateway(
+            &local_gateway_clone,
+            &local_cid_clone,
+            local_config_clone.local_timeout_ms,
+            local_config_clone.max_bytes,
+        )
+        .await;
+        ("local", local_gateway_clone, local_cid_clone, result)
+    });
 
-    match local_result {
-        Ok(Ok((bytes, elapsed_ms))) => {
-            // Local gateway succeeded within threshold
-            let total_elapsed = total_start.elapsed().as_millis() as u64;
-            let kbps = if elapsed_ms > 0 { (bytes * 1000 / elapsed_ms) / 1024 } else { 0 };
-            
-            print_line(vec![
-                ("event", Value::from("smart_ipfs_fetch_success")),
-                ("strategy", Value::from("local_only")),
-                ("subject", Value::from(subject)),
-                ("mint", Value::from(mint)),
-                ("cid", Value::from(cid)),
-                ("gateway", Value::from(config.local_gateway)),
-                ("bytes", Value::from(bytes as i64)),
-                ("fetch_elapsed_ms", Value::from(elapsed_ms as i64)),
-                ("total_elapsed_ms", Value::from(total_elapsed as i64)),
-                ("speed_kbps", Value::from(kbps as i64)),
-            ]);
-            return;
+    // Use select to race between threshold timer and local gateway
+    let threshold_future = sleep(Duration::from_millis(config.fallback_threshold_ms));
+    
+    tokio::select! {
+        // Local gateway completed within threshold
+        local_result = &mut local_task => {
+            match local_result {
+                Ok(("local", gateway, _task_cid, Ok((bytes, elapsed_ms)))) => {
+                    // Local gateway succeeded within threshold
+                    let total_elapsed = total_start.elapsed().as_millis() as u64;
+                    let kbps = if elapsed_ms > 0 { (bytes * 1000 / elapsed_ms) / 1024 } else { 0 };
+                    
+                    print_line(vec![
+                        ("event", Value::from("smart_ipfs_fetch_success")),
+                        ("strategy", Value::from("local_only")),
+                        ("subject", Value::from(subject)),
+                        ("mint", Value::from(mint)),
+                        ("cid", Value::from(cid)),
+                        ("gateway", Value::from(gateway)),
+                        ("bytes", Value::from(bytes as i64)),
+                        ("fetch_elapsed_ms", Value::from(elapsed_ms as i64)),
+                        ("total_elapsed_ms", Value::from(total_elapsed as i64)),
+                        ("speed_kbps", Value::from(kbps as i64)),
+                    ]);
+                    return;
+                }
+                Ok(("local", gateway, _task_cid, Err(err))) => {
+                    // Local gateway failed within threshold
+                    print_line(vec![
+                        ("event", Value::from("smart_ipfs_local_failed")),
+                        ("subject", Value::from(subject.clone())),
+                        ("mint", Value::from(mint.clone())),
+                        ("cid", Value::from(cid.clone())),
+                        ("gateway", Value::from(gateway)),
+                        ("error", Value::from(err)),
+                        ("elapsed_ms", Value::from(total_start.elapsed().as_millis() as i64)),
+                    ]);
+                    // Continue to fallback (local_task is consumed)
+                }
+                _ => {
+                    // Shouldn't happen, but handle gracefully
+                }
+            }
         }
-        Ok(Err(err)) => {
-            // Local gateway failed within threshold
-            let local_elapsed = local_start.elapsed().as_millis() as u64;
+        // Threshold exceeded, start fallback while keeping local gateway running
+        _ = threshold_future => {
             print_line(vec![
-                ("event", Value::from("smart_ipfs_local_failed")),
-                ("subject", Value::from(subject.clone())),
-                ("mint", Value::from(mint.clone())),
-                ("cid", Value::from(cid.clone())),
-                ("gateway", Value::from(config.local_gateway.clone())),
-                ("error", Value::from(err)),
-                ("elapsed_ms", Value::from(local_elapsed as i64)),
-            ]);
-        }
-        Err(_) => {
-            // Local gateway timed out (exceeded threshold)
-            print_line(vec![
-                ("event", Value::from("smart_ipfs_local_timeout")),
+                ("event", Value::from("smart_ipfs_local_threshold_exceeded")),
                 ("subject", Value::from(subject.clone())),
                 ("mint", Value::from(mint.clone())),
                 ("cid", Value::from(cid.clone())),
@@ -438,7 +452,7 @@ async fn smart_ipfs_fetch_and_log(
         }
     }
 
-    // Phase 2: Fallback to public gateways (concurrent)
+    // Phase 2: Start public gateways while keeping local gateway running (if still alive)
     print_line(vec![
         ("event", Value::from("smart_ipfs_fallback_start")),
         ("subject", Value::from(subject.clone())),
@@ -450,6 +464,12 @@ async fn smart_ipfs_fetch_and_log(
     let fallback_start = Instant::now();
     let mut tasks = Vec::new();
     
+    // Add local gateway task to competition (if still running)
+    if !local_task.is_finished() {
+        tasks.push(local_task);
+    }
+    
+    // Add public gateway tasks
     for gateway in &config.public_gateways {
         let gateway_clone = gateway.clone();
         let cid_clone = cid.clone();
@@ -463,7 +483,7 @@ async fn smart_ipfs_fetch_and_log(
                 config_clone.max_bytes,
             )
             .await;
-            (gateway_clone, cid_clone, result)
+            ("public", gateway_clone, cid_clone, result)
         });
         
         tasks.push(task);
@@ -494,15 +514,28 @@ async fn smart_ipfs_fetch_and_log(
         remaining_tasks = remaining;
 
         match result {
-            Ok((gateway, task_cid, Ok((bytes, elapsed_ms)))) => {
+            Ok((gateway_type, gateway, task_cid, Ok((bytes, elapsed_ms)))) => {
                 // First success! Calculate timing immediately
                 let total_elapsed = total_start.elapsed().as_millis() as u64;
                 let fallback_elapsed = fallback_start.elapsed().as_millis() as u64;
                 let kbps = if elapsed_ms > 0 { (bytes * 1000 / elapsed_ms) / 1024 } else { 0 };
                 
+                // Determine strategy based on which gateway won
+                let strategy = if gateway_type == "local" {
+                    "local_after_threshold"
+                } else {
+                    "fallback_to_public"
+                };
+                
                 // Log the successful gateway
+                let success_event = if gateway_type == "local" {
+                    "smart_ipfs_local_late_success"
+                } else {
+                    "smart_ipfs_public_success"
+                };
+                
                 print_line(vec![
-                    ("event", Value::from("smart_ipfs_public_success")),
+                    ("event", Value::from(success_event)),
                     ("gateway", Value::from(gateway.clone())),
                     ("cid", Value::from(task_cid)),
                     ("bytes", Value::from(bytes as i64)),
@@ -512,7 +545,7 @@ async fn smart_ipfs_fetch_and_log(
                 // Log final success immediately
                 print_line(vec![
                     ("event", Value::from("smart_ipfs_fetch_success")),
-                    ("strategy", Value::from("fallback_to_public")),
+                    ("strategy", Value::from(strategy)),
                     ("subject", Value::from(subject)),
                     ("mint", Value::from(mint)),
                     ("cid", Value::from(cid)),
@@ -528,10 +561,17 @@ async fn smart_ipfs_fetch_and_log(
                 // Success! Remaining tasks will be cancelled when dropped
                 return;
             }
-            Ok((gateway, task_cid, Err(err))) => {
+            Ok((gateway_type, gateway, task_cid, Err(err))) => {
                 failed_gateways.push((gateway.clone(), err.clone()));
+                
+                let failure_event = if gateway_type == "local" {
+                    "smart_ipfs_local_failed"
+                } else {
+                    "smart_ipfs_public_failed"
+                };
+                
                 print_line(vec![
-                    ("event", Value::from("smart_ipfs_public_failed")),
+                    ("event", Value::from(failure_event)),
                     ("gateway", Value::from(gateway)),
                     ("cid", Value::from(task_cid)),
                     ("error", Value::from(err)),
