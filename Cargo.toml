@@ -3,6 +3,14 @@ name = "rs-subscriber"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "rs-subscriber"
+path = "src/main.rs"
+
+[[bin]]
+name = "smart-fetcher"
+path = "src/smart_fetcher.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }

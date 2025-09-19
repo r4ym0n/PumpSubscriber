@@ -6,7 +6,7 @@ use url::Url;
 use serde_json::{json, Map, Value};
 use std::{env, time::Duration};
 use std::time::Instant;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use dotenvy::dotenv;
 
@@ -203,38 +203,68 @@ fn build_connect_options() -> Value {
 }
 
 #[derive(Clone)]
-struct IpfsConfig {
+struct SmartIpfsConfig {
     enabled: bool,
-    gateway: String,
-    gateways: Vec<String>,
-    timeout_ms: u64,
+    local_gateway: String,
+    public_gateways: Vec<String>,
+    local_timeout_ms: u64,
+    public_timeout_ms: u64,
     max_bytes: u64,
+    fallback_threshold_ms: u64,
 }
 
-impl IpfsConfig {
+impl SmartIpfsConfig {
     fn from_env() -> Self {
-        let enabled = env_bool("IPFS_PULL_ENABLED", false);
-        // Prefer multiple gateways if provided, fallback to single gateway var, then default
-        let gateways: Vec<String> = match env::var("IPFS_GATEWAYS") {
+        let enabled = env_bool("SMART_IPFS_ENABLED", true);
+        
+        // Local gateway configuration
+        let local_gateway = env::var("SMART_IPFS_LOCAL_GATEWAY")
+            .unwrap_or_else(|_| "http://localhost:8080/ipfs".to_string());
+        
+        // Public gateways configuration
+        let public_gateways: Vec<String> = match env::var("SMART_IPFS_PUBLIC_GATEWAYS") {
             Ok(v) => v
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            Err(_) => Vec::new(),
+            Err(_) => vec![
+                "https://ipfs.io/ipfs".to_string(),
+                "https://gateway.pinata.cloud/ipfs".to_string(),
+                "https://cloudflare-ipfs.com/ipfs".to_string(),
+                "https://dweb.link/ipfs".to_string(),
+            ],
         };
-        let gateway_single = env::var("IPFS_GATEWAY").ok();
-        let gateways = if !gateways.is_empty() {
-            gateways
-        } else if let Some(g) = gateway_single.clone() {
-            vec![g]
-        } else {
-            vec!["https://ipfs.io/ipfs".to_string()]
-        };
-        let gateway = gateways.first().cloned().unwrap_or_else(|| "https://ipfs.io/ipfs".to_string());
-        let timeout_ms = env::var("IPFS_TIMEOUT_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20000);
-        let max_bytes = env::var("IPFS_MAX_BYTES").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20 * 1024 * 1024);
-        Self { enabled, gateway, gateways, timeout_ms, max_bytes }
+        
+        let local_timeout_ms = env::var("SMART_IPFS_LOCAL_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000);
+            
+        let public_timeout_ms = env::var("SMART_IPFS_PUBLIC_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30000);
+            
+        let max_bytes = env::var("SMART_IPFS_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20 * 1024 * 1024);
+            
+        let fallback_threshold_ms = env::var("SMART_IPFS_FALLBACK_THRESHOLD_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200);
+
+        Self {
+            enabled,
+            local_gateway,
+            public_gateways,
+            local_timeout_ms,
+            public_timeout_ms,
+            max_bytes,
+            fallback_threshold_ms,
+        }
     }
 }
 
@@ -286,98 +316,250 @@ fn build_gateway_url(gateway: &str, cid: &str) -> String {
     format!("{}/{}", g, cid)
 }
 
-async fn ipfs_fetch_and_log(subject: String, mint: String, cid: String, gateway: String, ipfs: IpfsConfig) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(ipfs.timeout_ms))
+async fn fetch_from_gateway(
+    gateway: &str,
+    cid: &str,
+    timeout_ms: u64,
+    max_bytes: u64,
+) -> Result<(u64, u64), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            print_line(vec![
-                ("event", Value::from("ipfs_pull_error")),
-                ("subject", Value::from(subject)),
-                ("mint", Value::from(mint)),
-                ("cid", Value::from(cid)),
-                ("gateway", Value::from(gateway)),
-                ("error", Value::from(format!("client_build: {}", e))),
-            ]);
-            return;
+        .map_err(|e| format!("client_build: {}", e))?;
+
+    let final_url = build_gateway_url(gateway, cid);
+    let started = Instant::now();
+    
+    let resp = client
+        .get(final_url.clone())
+        .send()
+        .await
+        .map_err(|e| format!("request_failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("http_status: {}", resp.status().as_u16()));
+    }
+
+    let mut bytes: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt as _;
+    
+    while let Some(chunk_res) = stream.next().await {
+        match chunk_res {
+            Ok(chunk) => {
+                bytes += chunk.len() as u64;
+                if bytes >= max_bytes {
+                    break;
+                }
+            }
+            Err(e) => {
+                return Err(format!("stream_error: {}", e));
+            }
         }
-    };
+    }
+    
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok((bytes, elapsed_ms))
+}
 
-    let final_url = build_gateway_url(&gateway, &cid);
-
+async fn smart_ipfs_fetch_and_log(
+    subject: String,
+    mint: String,
+    cid: String,
+    config: SmartIpfsConfig,
+) {
+    let total_start = Instant::now();
+    
     print_line(vec![
-        ("event", Value::from("ipfs_pull_start")),
+        ("event", Value::from("smart_ipfs_fetch_start")),
         ("subject", Value::from(subject.clone())),
         ("mint", Value::from(mint.clone())),
         ("cid", Value::from(cid.clone())),
-        ("gateway", Value::from(gateway.clone())),
-        ("url", Value::from(final_url.clone())),
+        ("local_gateway", Value::from(config.local_gateway.clone())),
+        ("fallback_threshold_ms", Value::from(config.fallback_threshold_ms as i64)),
     ]);
 
-    let started = Instant::now();
-    let mut bytes: u64 = 0;
-    match client.get(final_url.clone()).send().await {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                print_line(vec![
-                    ("event", Value::from("ipfs_pull_error")),
-                    ("subject", Value::from(subject)),
-                    ("mint", Value::from(mint)),
-                    ("cid", Value::from(cid)),
-                    ("gateway", Value::from(gateway)),
-                    ("url", Value::from(final_url)),
-                    ("status", Value::from(resp.status().as_u16() as i64)),
-                ]);
-                return;
-            }
+    // Phase 1: Try local gateway with timeout
+    let local_start = Instant::now();
+    let local_result = timeout(
+        Duration::from_millis(config.fallback_threshold_ms),
+        fetch_from_gateway(
+            &config.local_gateway,
+            &cid,
+            config.local_timeout_ms,
+            config.max_bytes,
+        ),
+    )
+    .await;
 
-            let mut stream = resp.bytes_stream();
-            use futures_util::StreamExt as _;
-            while let Some(chunk_res) = stream.next().await {
-                match chunk_res {
-                    Ok(chunk) => {
-                        bytes += chunk.len() as u64;
-                        if bytes >= ipfs.max_bytes { break; }
-                    }
-                    Err(e) => {
-                        print_line(vec![
-                            ("event", Value::from("ipfs_pull_error")),
-                            ("error", Value::from(e.to_string())),
-                            ("bytes", Value::from(bytes as i64)),
-                            ("cid", Value::from(cid.clone())),
-                            ("gateway", Value::from(gateway.clone())),
-                        ]);
-                        return;
-                    }
-                }
-            }
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-            let kbps = if elapsed_ms > 0 { (bytes * 1000 / elapsed_ms) as u64 / 1024 } else { 0 };
+    match local_result {
+        Ok(Ok((bytes, elapsed_ms))) => {
+            // Local gateway succeeded within threshold
+            let total_elapsed = total_start.elapsed().as_millis() as u64;
+            let kbps = if elapsed_ms > 0 { (bytes * 1000 / elapsed_ms) / 1024 } else { 0 };
+            
             print_line(vec![
-                ("event", Value::from("ipfs_pull_done")),
+                ("event", Value::from("smart_ipfs_fetch_success")),
+                ("strategy", Value::from("local_only")),
+                ("subject", Value::from(subject)),
+                ("mint", Value::from(mint)),
+                ("cid", Value::from(cid)),
+                ("gateway", Value::from(config.local_gateway)),
                 ("bytes", Value::from(bytes as i64)),
-                ("elapsed_ms", Value::from(elapsed_ms as i64)),
+                ("fetch_elapsed_ms", Value::from(elapsed_ms as i64)),
+                ("total_elapsed_ms", Value::from(total_elapsed as i64)),
                 ("speed_kbps", Value::from(kbps as i64)),
+            ]);
+            return;
+        }
+        Ok(Err(err)) => {
+            // Local gateway failed within threshold
+            let local_elapsed = local_start.elapsed().as_millis() as u64;
+            print_line(vec![
+                ("event", Value::from("smart_ipfs_local_failed")),
+                ("subject", Value::from(subject.clone())),
+                ("mint", Value::from(mint.clone())),
                 ("cid", Value::from(cid.clone())),
-                ("gateway", Value::from(gateway)),
+                ("gateway", Value::from(config.local_gateway.clone())),
+                ("error", Value::from(err)),
+                ("elapsed_ms", Value::from(local_elapsed as i64)),
             ]);
         }
-        Err(e) => {
+        Err(_) => {
+            // Local gateway timed out (exceeded threshold)
             print_line(vec![
-                ("event", Value::from("ipfs_pull_error")),
-                ("error", Value::from(e.to_string())),
-                ("cid", Value::from(cid)),
-                ("gateway", Value::from(gateway)),
+                ("event", Value::from("smart_ipfs_local_timeout")),
+                ("subject", Value::from(subject.clone())),
+                ("mint", Value::from(mint.clone())),
+                ("cid", Value::from(cid.clone())),
+                ("gateway", Value::from(config.local_gateway.clone())),
+                ("threshold_ms", Value::from(config.fallback_threshold_ms as i64)),
             ]);
         }
     }
+
+    // Phase 2: Fallback to public gateways (concurrent)
+    print_line(vec![
+        ("event", Value::from("smart_ipfs_fallback_start")),
+        ("subject", Value::from(subject.clone())),
+        ("mint", Value::from(mint.clone())),
+        ("cid", Value::from(cid.clone())),
+        ("public_gateways_count", Value::from(config.public_gateways.len() as i64)),
+    ]);
+
+    let fallback_start = Instant::now();
+    let mut tasks = Vec::new();
+    
+    for gateway in &config.public_gateways {
+        let gateway_clone = gateway.clone();
+        let cid_clone = cid.clone();
+        let config_clone = config.clone();
+        
+        let task = tokio::spawn(async move {
+            let result = fetch_from_gateway(
+                &gateway_clone,
+                &cid_clone,
+                config_clone.public_timeout_ms,
+                config_clone.max_bytes,
+            )
+            .await;
+            (gateway_clone, cid_clone, result)
+        });
+        
+        tasks.push(task);
+    }
+
+    // Wait for first successful result or all failures
+    let mut successful_gateway = None;
+    let mut successful_result = None;
+    let mut failed_gateways = Vec::new();
+
+    for task in tasks {
+        match task.await {
+            Ok((gateway, task_cid, Ok((bytes, elapsed_ms)))) => {
+                if successful_gateway.is_none() {
+                    successful_gateway = Some(gateway.clone());
+                    successful_result = Some((bytes, elapsed_ms));
+                    
+                    // Log the successful gateway
+                    print_line(vec![
+                        ("event", Value::from("smart_ipfs_public_success")),
+                        ("gateway", Value::from(gateway)),
+                        ("cid", Value::from(task_cid)),
+                        ("bytes", Value::from(bytes as i64)),
+                        ("elapsed_ms", Value::from(elapsed_ms as i64)),
+                    ]);
+                } else {
+                    // Log additional successful gateways
+                    print_line(vec![
+                        ("event", Value::from("smart_ipfs_public_additional_success")),
+                        ("gateway", Value::from(gateway)),
+                        ("cid", Value::from(task_cid)),
+                        ("bytes", Value::from(bytes as i64)),
+                        ("elapsed_ms", Value::from(elapsed_ms as i64)),
+                    ]);
+                }
+            }
+            Ok((gateway, task_cid, Err(err))) => {
+                failed_gateways.push((gateway.clone(), err.clone()));
+                print_line(vec![
+                    ("event", Value::from("smart_ipfs_public_failed")),
+                    ("gateway", Value::from(gateway)),
+                    ("cid", Value::from(task_cid)),
+                    ("error", Value::from(err)),
+                ]);
+            }
+            Err(join_err) => {
+                print_line(vec![
+                    ("event", Value::from("smart_ipfs_task_error")),
+                    ("cid", Value::from(cid.clone())),
+                    ("error", Value::from(join_err.to_string())),
+                ]);
+            }
+        }
+    }
+
+    let total_elapsed = total_start.elapsed().as_millis() as u64;
+    let fallback_elapsed = fallback_start.elapsed().as_millis() as u64;
+
+    if let (Some(gateway), Some((bytes, fetch_elapsed))) = (successful_gateway, successful_result) {
+        let kbps = if fetch_elapsed > 0 { (bytes * 1000 / fetch_elapsed) / 1024 } else { 0 };
+        
+        print_line(vec![
+            ("event", Value::from("smart_ipfs_fetch_success")),
+            ("strategy", Value::from("fallback_to_public")),
+            ("subject", Value::from(subject)),
+            ("mint", Value::from(mint)),
+            ("cid", Value::from(cid)),
+            ("successful_gateway", Value::from(gateway)),
+            ("bytes", Value::from(bytes as i64)),
+            ("fetch_elapsed_ms", Value::from(fetch_elapsed as i64)),
+            ("fallback_elapsed_ms", Value::from(fallback_elapsed as i64)),
+            ("total_elapsed_ms", Value::from(total_elapsed as i64)),
+            ("speed_kbps", Value::from(kbps as i64)),
+            ("failed_gateways_count", Value::from(failed_gateways.len() as i64)),
+        ]);
+    } else {
+        print_line(vec![
+            ("event", Value::from("smart_ipfs_fetch_failed")),
+            ("subject", Value::from(subject)),
+            ("mint", Value::from(mint)),
+            ("cid", Value::from(cid)),
+            ("total_elapsed_ms", Value::from(total_elapsed as i64)),
+            ("failed_gateways_count", Value::from(failed_gateways.len() as i64)),
+            ("all_gateways_failed", Value::Bool(true)),
+        ]);
+    }
 }
 
-fn try_spawn_ipfs_fetch(subject: &str, body: &str, ipfs: &IpfsConfig) {
-    if !ipfs.enabled { return; }
-    if !subject.starts_with("coinImageUpdated") { return; }
+fn try_spawn_smart_ipfs_fetch(subject: &str, body: &str, config: &SmartIpfsConfig) {
+    if !config.enabled {
+        return;
+    }
+    if !subject.starts_with("coinImageUpdated") {
+        return;
+    }
+    
     // Try to unwrap quoted JSON string if needed (payloads can be JSON strings)
     let mut text = body.to_string();
     if text.starts_with('"') && text.ends_with('"') {
@@ -385,36 +567,33 @@ fn try_spawn_ipfs_fetch(subject: &str, body: &str, ipfs: &IpfsConfig) {
             text = unwrapped;
         }
     }
+    
     match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(obj)) => {
             let mint = obj.get("mint").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let image_s = obj.get("image").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            
             if image_s.is_empty() {
                 print_line(vec![
-                    ("event", Value::from("ipfs_pull_skip")),
+                    ("event", Value::from("smart_ipfs_skip")),
                     ("reason", Value::from("no_image")),
                     ("subject", Value::from(subject)),
                     ("mint", Value::from(mint)),
                 ]);
                 return;
             }
+            
             if let Some(cid) = extract_cid_from_url(&image_s) {
                 let subject_s = subject.to_string();
-                let ipfs_cfg = ipfs.clone();
-                let gateways = ipfs_cfg.gateways.clone();
-                for gw in gateways {
-                    let subject_s2 = subject_s.clone();
-                    let mint2 = mint.clone();
-                    let cid2 = cid.clone();
-                    let ipfs_cfg2 = ipfs_cfg.clone();
-                    tokio::spawn(async move {
-                        ipfs_fetch_and_log(subject_s2, mint2, cid2, gw, ipfs_cfg2).await;
-                    });
-                }
+                let config_clone = config.clone();
+                
+                tokio::spawn(async move {
+                    smart_ipfs_fetch_and_log(subject_s, mint, cid, config_clone).await;
+                });
             } else {
                 let preview: String = image_s.chars().take(200).collect();
                 print_line(vec![
-                    ("event", Value::from("ipfs_pull_skip")),
+                    ("event", Value::from("smart_ipfs_skip")),
                     ("reason", Value::from("no_cid")),
                     ("subject", Value::from(subject)),
                     ("mint", Value::from(mint)),
@@ -424,14 +603,14 @@ fn try_spawn_ipfs_fetch(subject: &str, body: &str, ipfs: &IpfsConfig) {
         }
         Ok(_) => {
             print_line(vec![
-                ("event", Value::from("ipfs_pull_skip")),
+                ("event", Value::from("smart_ipfs_skip")),
                 ("reason", Value::from("json_not_object")),
                 ("subject", Value::from(subject)),
             ]);
         }
         Err(e) => {
             print_line(vec![
-                ("event", Value::from("ipfs_pull_skip")),
+                ("event", Value::from("smart_ipfs_skip")),
                 ("reason", Value::from("json_parse_error")),
                 ("subject", Value::from(subject)),
                 ("error", Value::from(e.to_string())),
@@ -440,7 +619,7 @@ fn try_spawn_ipfs_fetch(subject: &str, body: &str, ipfs: &IpfsConfig) {
     }
 }
 
-async fn run_once(url: &str, vcfg: &ValidateConfig, ipfs: &IpfsConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_once(url: &str, vcfg: &ValidateConfig, smart_ipfs: &SmartIpfsConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url_parsed = Url::parse(url)?;
     let mut req: Request<()> = url_parsed.as_str().into_client_request()?;
     let headers = req.headers_mut();
@@ -524,11 +703,11 @@ async fn run_once(url: &str, vcfg: &ValidateConfig, ipfs: &IpfsConfig) -> Result
                 let body = &payload_block[hlen..];
                 let subject = current_subject.as_deref().unwrap_or("");
                 print_parsed_line(subject, body, vcfg);
-                try_spawn_ipfs_fetch(subject, body, ipfs);
+                try_spawn_smart_ipfs_fetch(subject, body, smart_ipfs);
             } else {
                 let subject = current_subject.as_deref().unwrap_or("");
                 print_parsed_line(subject, &payload_block, vcfg);
-                try_spawn_ipfs_fetch(subject, &payload_block, ipfs);
+                try_spawn_smart_ipfs_fetch(subject, &payload_block, smart_ipfs);
             }
 
             expected_payload = None;
@@ -626,25 +805,29 @@ async fn main() {
     let url = env::var("NATS_WS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
     let vcfg = ValidateConfig::from_env();
     let mut backoff: u64 = 1;
+    
     // Print current effective env configuration once at startup
-    let ipfs_preview = IpfsConfig::from_env();
+    let smart_ipfs_preview = SmartIpfsConfig::from_env();
     print_line(vec![
-        ("event", Value::from("startup_config")),
+        ("event", Value::from("smart_fetcher_startup_config")),
         ("NATS_WS_URL", Value::from(url.clone())),
         ("VALIDATE_ENABLED", Value::from(vcfg.enabled)),
         ("VALIDATE_ALLOWED_SUBJECTS", Value::from(Value::Array(vcfg.allowed_subject_prefixes.iter().map(|s| Value::from(s.clone())).collect()))),
         ("VALIDATE_REQUIRE_MINT", Value::from(vcfg.require_mint)),
         ("VALIDATE_REQUIRE_IMAGE", Value::from(vcfg.require_image)),
         ("VALIDATE_INFO_KEYS", Value::from(Value::Array(vcfg.require_info_keys.iter().map(|s| Value::from(s.clone())).collect()))),
-        ("IPFS_PULL_ENABLED", Value::from(ipfs_preview.enabled)),
-        ("IPFS_GATEWAY", Value::from(ipfs_preview.gateway.clone())),
-        ("IPFS_GATEWAYS", Value::from(Value::Array(ipfs_preview.gateways.iter().map(|s| Value::from(s.clone())).collect()))),
-        ("IPFS_TIMEOUT_MS", Value::from(ipfs_preview.timeout_ms as i64)),
-        ("IPFS_MAX_BYTES", Value::from(ipfs_preview.max_bytes as i64)),
+        ("SMART_IPFS_ENABLED", Value::from(smart_ipfs_preview.enabled)),
+        ("SMART_IPFS_LOCAL_GATEWAY", Value::from(smart_ipfs_preview.local_gateway.clone())),
+        ("SMART_IPFS_PUBLIC_GATEWAYS", Value::from(Value::Array(smart_ipfs_preview.public_gateways.iter().map(|s| Value::from(s.clone())).collect()))),
+        ("SMART_IPFS_LOCAL_TIMEOUT_MS", Value::from(smart_ipfs_preview.local_timeout_ms as i64)),
+        ("SMART_IPFS_PUBLIC_TIMEOUT_MS", Value::from(smart_ipfs_preview.public_timeout_ms as i64)),
+        ("SMART_IPFS_MAX_BYTES", Value::from(smart_ipfs_preview.max_bytes as i64)),
+        ("SMART_IPFS_FALLBACK_THRESHOLD_MS", Value::from(smart_ipfs_preview.fallback_threshold_ms as i64)),
     ]);
+    
     loop {
-        let ipfs = IpfsConfig::from_env();
-        match run_once(&url, &vcfg, &ipfs).await {
+        let smart_ipfs = SmartIpfsConfig::from_env();
+        match run_once(&url, &vcfg, &smart_ipfs).await {
             Ok(()) => {
                 backoff = 1; // normal end, but typically we shouldn't exit; reconnect anyway
             }
@@ -660,4 +843,3 @@ async fn main() {
         }
     }
 }
-

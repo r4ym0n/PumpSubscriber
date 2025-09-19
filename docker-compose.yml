@@ -8,4 +8,13 @@ services:
     container_name: rs-subscriber
     restart: unless-stopped
 
+  smart-fetcher:
+    build:
+      context: ./rs_subscriber
+    env_file:
+      - env/env.smart-fetcher
+    container_name: smart-fetcher
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/smart-fetcher"]
+
 
