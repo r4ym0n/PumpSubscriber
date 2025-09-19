@@ -204,9 +204,11 @@ def print_report(stats):
     all_times = [event.get('total_elapsed_ms', 0) for event in success_events]
     avg_time = statistics.mean(all_times)
     percentiles = calculate_percentiles(all_times)
+    p95_time = percentiles[95]
     
     print(f"样本数量: {len(all_times):,}")
     print(f"平均耗时: {format_time(avg_time)}")
+    print(f"P95耗时: {format_time(p95_time)}")
     print(f"最短耗时: {format_time(min(all_times))}")
     print(f"最长耗时: {format_time(max(all_times))}")
     print(f"标准差: {format_time(statistics.stdev(all_times) if len(all_times) > 1 else 0)}")
@@ -241,22 +243,23 @@ def print_report(stats):
         for gateway, times in gateway_stats.items():
             if times:
                 avg_time = statistics.mean(times)
-                gateway_performance.append((gateway, avg_time, len(times)))
+                p95_time = calculate_percentiles(times, [95])[95]
+                gateway_performance.append((gateway, avg_time, p95_time, len(times)))
         
         # 按平均时间排序
         gateway_performance.sort(key=lambda x: x[1])
         
-        print(f"{'网关':<35} {'平均耗时':<10} {'使用次数':<8} {'性能'}")
-        print("-" * 70)
+        print(f"{'网关':<35} {'平均耗时':<10} {'P95耗时':<10} {'次数':<6} {'性能'}")
+        print("-" * 80)
         
-        for gateway, avg_time, count in gateway_performance:
+        for gateway, avg_time, p95_time, count in gateway_performance:
             # 简化网关名称显示
             gateway_name = gateway.replace('https://', '').replace('/ipfs', '')
             if len(gateway_name) > 32:
                 gateway_name = gateway_name[:29] + "..."
             
             performance_bar = "★" * min(5, max(1, int(6 - avg_time/1000)))  # 性能星级
-            print(f"{gateway_name:<35} {format_time(avg_time):<10} {count:<8} {performance_bar}")
+            print(f"{gateway_name:<35} {format_time(avg_time):<10} {format_time(p95_time):<10} {count:<6} {performance_bar}")
     
     # 5. 文件大小和速度分析
     print(f"\n📦 文件大小和下载速度分析")
@@ -314,11 +317,11 @@ def print_report(stats):
     if slow_requests > 0:
         print(f"  • {slow_requests:,} 次拉取超过2秒({slow_requests/len(success_events)*100:.1f}%)，需要关注慢请求优化")
     
-    print(f"  • 平均拉取时间为 {format_time(avg_time)}，整体性能{'良好' if avg_time < 1000 else '一般' if avg_time < 2000 else '需要优化'}")
+    print(f"  • 平均拉取时间为 {format_time(avg_time)}，P95拉取时间为 {format_time(percentiles[95])}，整体性能{'良好' if avg_time < 1000 else '一般' if avg_time < 2000 else '需要优化'}")
     
     if gateway_performance:
         best_gateway = gateway_performance[0][0].replace('https://', '').replace('/ipfs', '')
-        print(f"  • 最快的公共网关是 {best_gateway}，平均响应时间 {format_time(gateway_performance[0][1])}")
+        print(f"  • 最快的公共网关是 {best_gateway}，平均响应时间 {format_time(gateway_performance[0][1])}，P95响应时间 {format_time(gateway_performance[0][2])}")
     
     print(f"\n💡 优化建议:")
     if local_count / len(success_events) < 0.5:
@@ -342,13 +345,22 @@ def main():
         
         if args.json:
             # 输出JSON格式的统计数据
+            all_times = [event.get('total_elapsed_ms', 0) for event in stats['success_events']]
+            overall_p95 = calculate_percentiles(all_times, [95])[95] if all_times else 0
+            overall_avg = statistics.mean(all_times) if all_times else 0
+            
             json_stats = {
                 'total_success': len(stats['success_events']),
                 'total_failed': len(stats['failed_events']),
                 'local_success_count': len(stats['local_success']),
                 'fallback_success_count': len(stats['fallback_success']),
-                'gateway_stats': {k: {'count': len(v), 'avg_time': statistics.mean(v) if v else 0} 
-                                for k, v in stats['gateway_stats'].items()}
+                'overall_avg_time': overall_avg,
+                'overall_p95_time': overall_p95,
+                'gateway_stats': {k: {
+                    'count': len(v), 
+                    'avg_time': statistics.mean(v) if v else 0,
+                    'p95_time': calculate_percentiles(v, [95])[95] if v else 0
+                } for k, v in stats['gateway_stats'].items()}
             }
             print(json.dumps(json_stats, indent=2, ensure_ascii=False))
         else:
