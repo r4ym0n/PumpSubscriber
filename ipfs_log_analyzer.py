@@ -190,10 +190,10 @@ class IPFSLogAnalyzer:
         """计算网关win rate（比其他网关快的次数）"""
         print("正在计算网关win rate...")
         
-        # 按文件分组（使用mint+subject作为文件标识）
+        # 按文件大小分组（相同大小认为是同一个文件）
         file_groups = defaultdict(list)
         for entry in self.entries:
-            file_key = f"{entry.mint}_{entry.subject}"
+            file_key = f"bytes_{entry.bytes}"
             file_groups[file_key].append(entry)
         
         gateway_wins = Counter()
@@ -238,10 +238,10 @@ class IPFSLogAnalyzer:
         """模拟总是使用最快网关的场景"""
         print("正在模拟最优网关选择场景...")
         
-        # 按文件分组
+        # 按文件大小分组（相同大小认为是同一个文件）
         file_groups = defaultdict(list)
         for entry in self.entries:
-            file_key = f"{entry.mint}_{entry.subject}"
+            file_key = f"bytes_{entry.bytes}"
             file_groups[file_key].append(entry)
         
         total_optimal_time = 0
