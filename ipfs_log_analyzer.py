@@ -61,8 +61,15 @@ class IPFSLogAnalyzer:
         if not line:
             return None
             
+        # 处理Docker日志格式，移除容器前缀
+        # 格式: rs-subscriber  | [2025-09-19 01:05:52.073] {"bytes":115303,"elapsed_ms":1154,...}
+        # 或者: [2025-09-19 01:05:52.073] {"bytes":115303,"elapsed_ms":1154,...}
+        
+        # 移除Docker容器前缀（如果存在）
+        docker_prefix_pattern = r'^[^|]*\|\s*'
+        line = re.sub(docker_prefix_pattern, '', line)
+        
         # 提取时间戳和JSON数据
-        # 格式: [2025-09-19 01:05:52.073] {"bytes":115303,"elapsed_ms":1154,...}
         match = re.match(r'\[([^\]]+)\]\s*(.+)', line)
         if not match:
             return None
