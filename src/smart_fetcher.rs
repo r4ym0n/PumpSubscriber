@@ -470,35 +470,63 @@ async fn smart_ipfs_fetch_and_log(
     }
 
     // Wait for first successful result or all failures
-    let mut successful_gateway = None;
-    let mut successful_result = None;
     let mut failed_gateways = Vec::new();
+    let mut remaining_tasks = tasks;
 
-    for task in tasks {
-        match task.await {
+    loop {
+        if remaining_tasks.is_empty() {
+            // All tasks failed
+            let total_elapsed = total_start.elapsed().as_millis() as u64;
+            print_line(vec![
+                ("event", Value::from("smart_ipfs_fetch_failed")),
+                ("subject", Value::from(subject)),
+                ("mint", Value::from(mint)),
+                ("cid", Value::from(cid)),
+                ("total_elapsed_ms", Value::from(total_elapsed as i64)),
+                ("failed_gateways_count", Value::from(failed_gateways.len() as i64)),
+                ("all_gateways_failed", Value::Bool(true)),
+            ]);
+            return;
+        }
+
+        // Wait for any task to complete
+        let (result, _index, remaining) = futures_util::future::select_all(remaining_tasks).await;
+        remaining_tasks = remaining;
+
+        match result {
             Ok((gateway, task_cid, Ok((bytes, elapsed_ms)))) => {
-                if successful_gateway.is_none() {
-                    successful_gateway = Some(gateway.clone());
-                    successful_result = Some((bytes, elapsed_ms));
-                    
-                    // Log the successful gateway
-                    print_line(vec![
-                        ("event", Value::from("smart_ipfs_public_success")),
-                        ("gateway", Value::from(gateway)),
-                        ("cid", Value::from(task_cid)),
-                        ("bytes", Value::from(bytes as i64)),
-                        ("elapsed_ms", Value::from(elapsed_ms as i64)),
-                    ]);
-                } else {
-                    // Log additional successful gateways
-                    print_line(vec![
-                        ("event", Value::from("smart_ipfs_public_additional_success")),
-                        ("gateway", Value::from(gateway)),
-                        ("cid", Value::from(task_cid)),
-                        ("bytes", Value::from(bytes as i64)),
-                        ("elapsed_ms", Value::from(elapsed_ms as i64)),
-                    ]);
-                }
+                // First success! Calculate timing immediately
+                let total_elapsed = total_start.elapsed().as_millis() as u64;
+                let fallback_elapsed = fallback_start.elapsed().as_millis() as u64;
+                let kbps = if elapsed_ms > 0 { (bytes * 1000 / elapsed_ms) / 1024 } else { 0 };
+                
+                // Log the successful gateway
+                print_line(vec![
+                    ("event", Value::from("smart_ipfs_public_success")),
+                    ("gateway", Value::from(gateway.clone())),
+                    ("cid", Value::from(task_cid)),
+                    ("bytes", Value::from(bytes as i64)),
+                    ("elapsed_ms", Value::from(elapsed_ms as i64)),
+                ]);
+                
+                // Log final success immediately
+                print_line(vec![
+                    ("event", Value::from("smart_ipfs_fetch_success")),
+                    ("strategy", Value::from("fallback_to_public")),
+                    ("subject", Value::from(subject)),
+                    ("mint", Value::from(mint)),
+                    ("cid", Value::from(cid)),
+                    ("successful_gateway", Value::from(gateway)),
+                    ("bytes", Value::from(bytes as i64)),
+                    ("fetch_elapsed_ms", Value::from(elapsed_ms as i64)),
+                    ("fallback_elapsed_ms", Value::from(fallback_elapsed as i64)),
+                    ("total_elapsed_ms", Value::from(total_elapsed as i64)),
+                    ("speed_kbps", Value::from(kbps as i64)),
+                    ("failed_gateways_count", Value::from(failed_gateways.len() as i64)),
+                ]);
+                
+                // Success! Remaining tasks will be cancelled when dropped
+                return;
             }
             Ok((gateway, task_cid, Err(err))) => {
                 failed_gateways.push((gateway.clone(), err.clone()));
@@ -508,6 +536,7 @@ async fn smart_ipfs_fetch_and_log(
                     ("cid", Value::from(task_cid)),
                     ("error", Value::from(err)),
                 ]);
+                // Continue to next task
             }
             Err(join_err) => {
                 print_line(vec![
@@ -515,40 +544,9 @@ async fn smart_ipfs_fetch_and_log(
                     ("cid", Value::from(cid.clone())),
                     ("error", Value::from(join_err.to_string())),
                 ]);
+                // Continue to next task
             }
         }
-    }
-
-    let total_elapsed = total_start.elapsed().as_millis() as u64;
-    let fallback_elapsed = fallback_start.elapsed().as_millis() as u64;
-
-    if let (Some(gateway), Some((bytes, fetch_elapsed))) = (successful_gateway, successful_result) {
-        let kbps = if fetch_elapsed > 0 { (bytes * 1000 / fetch_elapsed) / 1024 } else { 0 };
-        
-        print_line(vec![
-            ("event", Value::from("smart_ipfs_fetch_success")),
-            ("strategy", Value::from("fallback_to_public")),
-            ("subject", Value::from(subject)),
-            ("mint", Value::from(mint)),
-            ("cid", Value::from(cid)),
-            ("successful_gateway", Value::from(gateway)),
-            ("bytes", Value::from(bytes as i64)),
-            ("fetch_elapsed_ms", Value::from(fetch_elapsed as i64)),
-            ("fallback_elapsed_ms", Value::from(fallback_elapsed as i64)),
-            ("total_elapsed_ms", Value::from(total_elapsed as i64)),
-            ("speed_kbps", Value::from(kbps as i64)),
-            ("failed_gateways_count", Value::from(failed_gateways.len() as i64)),
-        ]);
-    } else {
-        print_line(vec![
-            ("event", Value::from("smart_ipfs_fetch_failed")),
-            ("subject", Value::from(subject)),
-            ("mint", Value::from(mint)),
-            ("cid", Value::from(cid)),
-            ("total_elapsed_ms", Value::from(total_elapsed as i64)),
-            ("failed_gateways_count", Value::from(failed_gateways.len() as i64)),
-            ("all_gateways_failed", Value::Bool(true)),
-        ]);
     }
 }
 
