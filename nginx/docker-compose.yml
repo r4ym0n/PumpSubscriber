@@ -1,0 +1,20 @@
+version: '3.8'
+services:
+  ipfs-nginx:
+    build: .
+    container_name: ipfs-nginx
+    ports:
+      - "8081:80"
+    env_file:
+      - ./env.common
+    environment:
+      - IPFS_GATEWAYS=,gateway.pinata.cloud,ipfs.io,dweb.link
+      - IPFS_CONNECT_TIMEOUT_MS=1000
+      - IPFS_READ_TIMEOUT_MS=4000
+      - IPFS_DEBUG=true
+      - IPFS_FALLBACK_ERROR=true
+      - IPFS_MATCH_MIME_PREFIX=image/
+      - IPFS_DEBUG=false
+      # IPFS_DELAY_MS can be defined in ../env/env.common (will be overridden here if set)
+      # - IPFS_DELAY_MS=0
+    restart: unless-stopped
