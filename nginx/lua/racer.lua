@@ -12,6 +12,7 @@ end
 local request_path = ngx.var.request_uri
 local gateways = gw.get_gateways()
 local timeouts = gw.get_timeouts()
+local ka = gw.keepalive()
 local debug = gw.is_debug()
 local fallback_error = gw.fallback_error()
 local mime_prefix = gw.match_mime_prefix()
@@ -29,7 +30,28 @@ local function is_mime_accepted(ct)
   return ct:lower():find(mime_prefix, 1, true) == 1
 end
 
-local function fetch_one(host, delay_ms)
+local function set_keepalive(httpc, host)
+  if not httpc then return end
+  local ok, err = httpc:set_keepalive(ka.timeout_ms, ka.pool_size)
+  if not ok and err then
+    log_debug('set_keepalive failed ' .. tostring(host) .. ': ' .. tostring(err))
+  end
+end
+
+local function join_paths(base, path)
+  if not base or base == '' then return path end
+  if base:sub(-1) == '/' and path:sub(1,1) == '/' then
+    return base .. path:sub(2)
+  elseif base:sub(-1) ~= '/' and path:sub(1,1) ~= '/' then
+    return base .. '/' .. path
+  else
+    return base .. path
+  end
+end
+
+local function fetch_one(gwspec, delay_ms)
+  local host = gwspec.host
+  local base = gwspec.base
   if delay_ms and delay_ms > 0 then ngx.sleep(delay_ms / 1000) end
 
   local httpc = http.new()
@@ -46,7 +68,7 @@ local function fetch_one(host, delay_ms)
   local sh_ok, sh_err = httpc:ssl_handshake(nil, host, timeouts.ssl_verify)
   if not sh_ok then
     log_debug('handshake failed ' .. host .. ': ' .. (sh_err or 'nil'))
-    pcall(function() httpc:close() end)
+    set_keepalive(httpc, host)
     return
   end
 
@@ -60,10 +82,11 @@ local function fetch_one(host, delay_ms)
     Accept = mime_prefix .. "*"
   }
 
-  local res, req_err = httpc:request({ method = method, path = request_path, headers = headers })
+  local path = join_paths(base, request_path)
+  local res, req_err = httpc:request({ method = method, path = path, headers = headers })
   if not res then
     log_debug('request failed ' .. host .. ': ' .. (req_err or 'nil'))
-    httpc:close()
+    set_keepalive(httpc, host)
     return
   end
 
@@ -83,14 +106,14 @@ local function fetch_one(host, delay_ms)
       local body = res:read_body()
       first_error = { status = status, headers = res.headers, body = body }
     end
-    pcall(function() httpc:close() end)
+    set_keepalive(httpc, host)
   end
 end
 
 local threads = {}
-for i, host in ipairs(gateways) do
+for i, spec in ipairs(gateways) do
   local delay_ms = (i - 1) * (timeouts.delay_ms or 0)
-  threads[#threads + 1] = ngx.thread.spawn(fetch_one, host, delay_ms)
+  threads[#threads + 1] = ngx.thread.spawn(fetch_one, spec, delay_ms)
 end
 
 local ok, perr = first_sem:wait(5)
@@ -113,6 +136,9 @@ end
 for i, th in ipairs(threads) do pcall(ngx.thread.kill, th) end
 local win = winner_slot.result
 
+-- mark selected gateway in response headers for logging
+ngx.header["X-Selected-Gateway"] = win.host
+
 local res = win.res
 for k, v in pairs(res.headers) do
   local kl = string.lower(k)
@@ -125,7 +151,7 @@ local reader = res.body_reader
 if not reader then
   local body = res:read_body()
   if body then ngx.print(body) end
-  win.httpc:set_keepalive()
+  set_keepalive(win.httpc, win.host)
   return
 end
 
@@ -137,4 +163,4 @@ while true do
   ngx.flush(true)
 end
 
-win.httpc:set_keepalive()
+set_keepalive(win.httpc, win.host)

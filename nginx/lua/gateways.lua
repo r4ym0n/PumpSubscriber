@@ -10,16 +10,30 @@ local function split_csv(value)
   return list
 end
 
+-- Parse gateway spec: "host" or "host/basepath"
+local function parse_gateway(spec)
+  local host, base = spec:match('^([^/]+)(/.*)$')
+  if host then
+    return { host = host, base = base }
+  else
+    return { host = spec, base = '' }
+  end
+end
+
 function M.get_gateways()
   local env_val = os.getenv('IPFS_GATEWAYS')
-  local list = split_csv(env_val)
-  if #list == 0 then
-    list = {
+  local items = split_csv(env_val)
+  local list = {}
+  if #items == 0 then
+    items = {
       'gateway.pinata.cloud',
       'ipfs.io',
       'dweb.link',
       'trustless-gateway.link'
     }
+  end
+  for _, it in ipairs(items) do
+    table.insert(list, parse_gateway(it))
   end
   return list
 end
@@ -45,6 +59,13 @@ function M.get_timeouts()
     read_timeout_ms    = to_number('IPFS_READ_TIMEOUT_MS', 4000),
     delay_ms           = to_number('IPFS_DELAY_MS', 0),
     ssl_verify         = to_bool('IPFS_SSL_VERIFY', true),
+  }
+end
+
+function M.keepalive()
+  return {
+    timeout_ms = to_number('IPFS_KEEPALIVE_TIMEOUT_MS', 60000),
+    pool_size  = to_number('IPFS_KEEPALIVE_POOL_SIZE', 64),
   }
 end
 
