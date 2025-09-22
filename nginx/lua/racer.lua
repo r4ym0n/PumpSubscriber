@@ -50,26 +50,30 @@ local function join_paths(base, path)
 end
 
 local function fetch_one(gwspec, delay_ms)
+  local scheme = gwspec.scheme
   local host = gwspec.host
+  local port = gwspec.port
   local base = gwspec.base
   if delay_ms and delay_ms > 0 then ngx.sleep(delay_ms / 1000) end
 
   local httpc = http.new()
   httpc:set_timeouts(timeouts.connect_timeout_ms, 1000, timeouts.read_timeout_ms)
 
-  log_debug('tcp connect ' .. host .. ':443')
-  local ok, err = httpc:connect(host, 443)
+  log_debug('tcp connect ' .. host .. ':' .. tostring(port))
+  local ok, err = httpc:connect(host, port)
   if not ok then
     log_debug('connect failed ' .. host .. ': ' .. (err or 'nil'))
     return
   end
 
-  log_debug('tls handshake ' .. host)
-  local sh_ok, sh_err = httpc:ssl_handshake(nil, host, timeouts.ssl_verify)
-  if not sh_ok then
-    log_debug('handshake failed ' .. host .. ': ' .. (sh_err or 'nil'))
-    set_keepalive(httpc, host)
-    return
+  if scheme == 'https' then
+    log_debug('tls handshake ' .. host)
+    local sh_ok, sh_err = httpc:ssl_handshake(nil, host, timeouts.ssl_verify)
+    if not sh_ok then
+      log_debug('handshake failed ' .. host .. ': ' .. (sh_err or 'nil'))
+      set_keepalive(httpc, host)
+      return
+    end
   end
 
   local headers = {
@@ -136,7 +140,6 @@ end
 for i, th in ipairs(threads) do pcall(ngx.thread.kill, th) end
 local win = winner_slot.result
 
--- mark selected gateway in response headers for logging
 ngx.header["X-Selected-Gateway"] = win.host
 
 local res = win.res

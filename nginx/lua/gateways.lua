@@ -10,14 +10,39 @@ local function split_csv(value)
   return list
 end
 
--- Parse gateway spec: "host" or "host/basepath"
+-- Parse gateway spec supporting:
+--  - https://host
+--  - http://host:port
+--  - host
+--  - host:port
+--  - host/basepath
+--  - https://host:port/basepath
 local function parse_gateway(spec)
-  local host, base = spec:match('^([^/]+)(/.*)$')
-  if host then
-    return { host = host, base = base }
-  else
-    return { host = spec, base = '' }
+  local scheme, rest = spec:match('^(https?)://(.+)$')
+  if not scheme then
+    scheme = 'https'
+    rest = spec
   end
+
+  local host_port, base = rest:match('^([^/]+)(/.*)$')
+  if not host_port then
+    host_port = rest
+    base = ''
+  end
+
+  local host, port_str = host_port:match('^([^:]+):(%d+)$')
+  if not host then
+    host = host_port
+  end
+
+  local port
+  if port_str then
+    port = tonumber(port_str)
+  else
+    port = (scheme == 'http') and 80 or 443
+  end
+
+  return { scheme = scheme, host = host, port = port, base = base }
 end
 
 function M.get_gateways()
